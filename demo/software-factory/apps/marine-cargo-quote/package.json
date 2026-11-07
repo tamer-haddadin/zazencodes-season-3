@@ -1,0 +1,14 @@
+{
+  "name": "marine-cargo-quote",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Indicative marine cargo premium quote micro-app (AED, UAE VAT).",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test --test-reporter spec"
+  }
+}

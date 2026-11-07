@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""Headless orchestrator for the software factory.
+
+Runs the same loop as .claude/skills/factory/SKILL.md, with each agent spawned
+as `claude -p --agent <name>`; the Claude Code session in the skill is replaced
+by this script, and the agents, prompts and files are identical. Python
+standard library only.
+
+Usage:
+  factory run "<feature>" [--slug <slug>]   new job: spec → build → gate → review → approve → merge | needs-human
+  factory next                               run the first unchecked item in factory/backlog.md
+  factory approve <job-id>                   merge a needs-human job into the base branch
+  factory rework <job-id> "<note>"           send a needs-human job back to the builder with feedback
+  factory status                             one line per job
+  factory plan "<feature>"                   print the claude commands a job would run, without running them
+  factory demo [--sandbox <dir>] [--keep]    replay the sample job in a throwaway repo with the mock engine
+  factory dashboard [--port 8000]            serve factory/dashboard.html
+
+Environment (also read from <project>/.env, see .env.example):
+  FACTORY_CLAUDE_BIN     claude binary to spawn (default: claude). `demo` points it at factory/mock/claude.
+  FACTORY_CLAUDE_FLAGS   extra flags for every claude call, e.g. "--max-budget-usd 5"
+  FACTORY_MAX_RESUMES    builder resumes after round 1 (default 2)
+  FACTORY_BASE_BRANCH    branch jobs start from and merge into (default main)
+  FACTORY_SANDBOX        where `demo` builds its repo (default /tmp/software-factory-demo)
+"""
+
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+PROJECT = Path(__file__).resolve().parents[2]  # the folder with AGENTS.md, apps/, factory/, .claude/
+FACTORY = PROJECT / "factory"
+JOBS = FACTORY / "jobs"
+AGENTS = PROJECT / ".claude" / "agents"
+REVIEWERS = ["security", "ux", "ui", "code"]
+PORT_BASE, PORT_STEP = 5100, 10
+SAMPLE_JOB = "001-marine-cargo-quote"
+
+
+# ---- Environment -----------------------------------------------------------
+
+
+def load_env():
+    """KEY=VALUE lines from <project>/.env; the real environment wins."""
+    env_file = PROJECT / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_env()
+CLAUDE_BIN = os.environ.get("FACTORY_CLAUDE_BIN", "claude")
+CLAUDE_FLAGS = shlex.split(os.environ.get("FACTORY_CLAUDE_FLAGS", ""))
+MAX_RESUMES = int(os.environ.get("FACTORY_MAX_RESUMES", "2"))
+BASE = os.environ.get("FACTORY_BASE_BRANCH", "main")
+SANDBOX = Path(os.environ.get("FACTORY_SANDBOX", "/tmp/software-factory-demo"))
+
+
+class Stop(Exception):
+    """The job cannot continue; the message goes to the user."""
+
+
+def die(msg, code=1):
+    print(f"factory: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def say(msg):
+    print(msg, flush=True)
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def run(cmd, cwd=None, check=True, env=None, capture=True):
+    res = subprocess.run(cmd, cwd=cwd, env=env, text=True, capture_output=capture)
+    if check and res.returncode != 0:
+        detail = ((res.stderr or "") + (res.stdout or "")).strip() if capture else ""
+        raise Stop(f"`{' '.join(map(str, cmd))}` failed{': ' + detail if detail else ''}")
+    return res
+
+
+# ---- Repo layout -----------------------------------------------------------
+
+
+def repo_root():
+    res = run(["git", "rev-parse", "--show-toplevel"], cwd=PROJECT, check=False)
+    if res.returncode != 0:
+        die("this folder is not inside a git repository")
+    return Path(res.stdout.strip())
+
+
+REPO = repo_root()
+REL = PROJECT.relative_to(REPO)  # "." when the factory sits at the repo root
+
+
+def project_in(worktree):
+    return Path(worktree) / REL if str(REL) != "." else Path(worktree)
+
+
+def worktree_path(job_id):
+    return REPO.parent / f"{REPO.name}-factory" / job_id
+
+
+# ---- Jobs ------------------------------------------------------------------
+
+
+def job_path(job_id):
+    return JOBS / job_id
+
+
+def load(job_id):
+    path = job_path(job_id) / "job.json"
+    if not path.exists():
+        die(f"no job {job_id}")
+    return json.loads(path.read_text())
+
+
+def save(job):
+    path = job_path(job["id"]) / "job.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(job, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def all_jobs():
+    if not JOBS.exists():
+        return []
+    return [load(p.name) for p in sorted(JOBS.iterdir()) if (p / "job.json").exists()]
+
+
+def job_number(job_id):
+    return int(job_id.split("-", 1)[0])
+
+
+def slugify(text, words=3):
+    tokens = re.findall(r"[a-z0-9]+", text.split(":")[0].lower())
+    return "-".join(tokens[:words]) or "feature"
+
+
+def first_line(path):
+    return path.read_text().split("\n", 1)[0].strip() if path.exists() else None
+
+
+def create_job(feature, slug=None):
+    JOBS.mkdir(parents=True, exist_ok=True)
+    numbers = [job_number(p.name) for p in JOBS.iterdir() if p.name[:3].isdigit()]
+    number = max(numbers, default=0) + 1
+    slug = slug or slugify(feature)
+    while True:
+        job_id = f"{number:03d}-{slug}"
+        try:
+            job_path(job_id).mkdir()  # no -p: claiming the number must be atomic
+            break
+        except FileExistsError:
+            number += 1
+    job = {
+        "id": job_id, "feature": feature, "branch": f"factory/{job_id}",
+        "worktree": str(worktree_path(job_id)), "base": BASE,
+        "stage": "spec", "round": 0, "gate": None,
+        "reviews": {r: "pending" for r in REVIEWERS},
+        "started": now(), "ended": None, "sessions": {},
+    }
+    save(job)
+    return job
+
+
+def set_stage(job, stage, **fields):
+    job["stage"] = stage
+    job.update(fields)
+    if stage in {"merged", "needs-human"}:
+        job["ended"] = now()
+    save(job)
+
+
+# ---- Agents ----------------------------------------------------------------
+
+
+def agent_tools(name):
+    """The `tools:` line of .claude/agents/<name>.md, for --allowedTools."""
+    text = (AGENTS / f"{name}.md").read_text()
+    m = re.search(r"^tools:\s*(.+)$", text, re.M)
+    return [t.strip() for t in m.group(1).split(",")] if m else []
+
+
+def paths_sentence(job):
+    return (f"Job folder: {job_path(job['id'])}/. Worktree: {job['worktree']}. "
+            f"Project: {project_in(job['worktree'])}. Branch: {job['branch']}.")
+
+
+def port_for(job, role):
+    n = job_number(job["id"])
+    offset = {"builder": 0, "ux": 1, "ui": 2}[role]
+    return PORT_BASE + PORT_STEP * n + offset
+
+
+def claude_command(job, agent, prompt, resume=None):
+    cmd = [CLAUDE_BIN, "-p", prompt, "--agent", agent, "--output-format", "json",
+           "--permission-mode", "acceptEdits", "--permission-prompts", "none",
+           "--add-dir", job["worktree"]]
+    tools = agent_tools(agent)
+    if tools:
+        cmd += ["--allowedTools", ",".join(tools)]
+    if resume:
+        cmd += ["--resume", resume]
+    return cmd + CLAUDE_FLAGS
+
+
+def spawn(job, agent, prompt, resume=None):
+    """Start one agent. Returns the Popen; read it with finish()."""
+    env = {**os.environ, "FACTORY_AGENT": agent, "FACTORY_JOB": job["id"]}
+    try:
+        return subprocess.Popen(claude_command(job, agent, prompt, resume), cwd=PROJECT, env=env,
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        raise Stop(f"{CLAUDE_BIN!r} not found. Install Claude Code (npm install -g @anthropic-ai/claude-code) "
+                   f"and log in, or run `factory demo` for the mock engine.")
+
+
+def finish(proc, agent):
+    """Wait for an agent and return its session id. Raises Stop on an error result."""
+    out, err = proc.communicate()
+    result = None
+    for candidate in [out.strip(), *reversed(out.strip().splitlines())]:
+        try:
+            result = json.loads(candidate)
+            break
+        except json.JSONDecodeError:
+            continue
+    if result is None:
+        raise Stop(f"{agent} produced no JSON result (exit {proc.returncode}):\n{(err or out).strip()[-2000:]}")
+    if proc.returncode != 0 or result.get("is_error"):
+        raise Stop(f"{agent} failed: {result.get('result') or err.strip()[-2000:]}")
+    return result.get("session_id")
+
+
+def run_agent(job, agent, prompt, resume=None):
+    return finish(spawn(job, agent, prompt, resume), agent)
+
+
+# ---- The loop --------------------------------------------------------------
+
+
+def setup_worktree(job):
+    run(["git", "worktree", "add", "-b", job["branch"], job["worktree"], job["base"]], cwd=REPO)
+
+
+def write_spec(job):
+    run_agent(job, "spec-writer", f"{paths_sentence(job)} Feature: {job['feature']}")
+    if not (job_path(job["id"]) / "spec.md").exists():
+        raise Stop("spec-writer finished without writing spec.md")
+    say(f"{job['id']}: spec written")
+
+
+def build(job, message):
+    set_stage(job, "build")
+    resume = job["sessions"].get("builder")
+    session = run_agent(job, "builder", message, resume=resume)
+    if session and not resume:
+        job["sessions"]["builder"] = session
+        save(job)
+    status = first_line(job_path(job["id"]) / "build.md")
+    if status == "STATUS: READY":
+        say(f"{job['id']}: build READY")
+        return True
+    if status == "STATUS: BLOCKED":
+        say(f"{job['id']}: build BLOCKED")
+        return False
+    raise Stop(f"build.md starts with {status!r}, not STATUS: READY or STATUS: BLOCKED")
+
+
+def gate(job, merge=False):
+    """Run the main checkout's checks.sh inside the worktree. Returns PASS or FAIL."""
+    rd = job_path(job["id"]) / f"round-{job['round']}"
+    rd.mkdir(exist_ok=True)
+    cwd = project_in(job["worktree"])
+    commit = run(["git", "rev-parse", "HEAD"], cwd=job["worktree"]).stdout.strip()
+    start = time.monotonic()
+    res = run(["bash", str(FACTORY / "checks.sh")], cwd=cwd, check=False)
+    seconds = int(time.monotonic() - start)
+    verdict = "PASS" if res.returncode == 0 else "FAIL"
+    log = (res.stdout + res.stderr).strip()
+    name = "merge-checks" if merge else "checks"
+    (rd / f"{name}.md").write_text(
+        f"GATE: {verdict}\nCOMMIT: {commit}\n\n"
+        f"`factory/checks.sh` exited {res.returncode} in {seconds}s"
+        f"{', after syncing with ' + job['base'] if merge else ''}.\n\n```\n{log}\n```\n")
+    return verdict
+
+
+def review_round(job):
+    rd = job_path(job["id"]) / f"round-{job['round']}"
+    procs = {}
+    for r in REVIEWERS:
+        prompt = f"{paths_sentence(job)} Review round {job['round']}."
+        if r in {"ux", "ui"}:
+            prompt += f" Port: {port_for(job, r)}."
+        procs[r] = spawn(job, f"reviewer-{r}", prompt)
+    # WAIT FOR ALL: record each verdict as it lands, decide only when all four are in.
+    pending = dict(procs)
+    failures = []
+    while pending:
+        for r, proc in list(pending.items()):
+            if proc.poll() is None:
+                continue
+            del pending[r]
+            try:
+                finish(proc, f"reviewer-{r}")
+            except Stop as e:
+                failures.append(str(e))
+            line = first_line(rd / f"review-{r}.md")
+            m = re.fullmatch(r"VERDICT:\s*(PASS|CHANGES)", line or "")
+            job["reviews"][r] = m.group(1) if m else "invalid"
+            save(job)
+            say(f"{job['id']}: round {job['round']}, {r} {job['reviews'][r]}")
+        time.sleep(0.2)
+    if failures:
+        raise Stop("\n".join(failures))
+    bad = [r for r, v in job["reviews"].items() if v not in {"PASS", "CHANGES"}]
+    if bad:
+        raise Stop(f"review-{bad[0]}.md is missing or its first line isn't a verdict")
+    return [r for r, v in job["reviews"].items() if v == "CHANGES"]
+
+
+def start_round(job):
+    set_stage(job, "review", round=job["round"] + 1, gate=None, reviews={r: "pending" for r in REVIEWERS})
+    (job_path(job["id"]) / f"round-{job['round']}").mkdir(exist_ok=True)
+
+
+def escalate(job, why):
+    (job_path(job["id"]) / "decision.md").write_text(f"ESCALATE\n\n## Why\n{why}\n")
+
+
+def needs_human(job):
+    set_stage(job, "needs-human")
+    d = job_path(job["id"])
+    reason = (d / "decision.md") if (d / "decision.md").exists() else (d / "build.md")
+    say(f"\n{job['id']} needs a human. Worktree: {job['worktree']}\n")
+    say(indent(reason.read_text().strip()))
+    say(f"\nNext: factory approve {job['id']}   or   factory rework {job['id']} \"<note>\"")
+
+
+def indent(text):
+    return "\n".join("    " + l for l in text.splitlines())
+
+
+def merge(job):
+    """Merge the job branch into the base branch in the main checkout."""
+    dirty = run(["git", "status", "--porcelain", "--", ".",
+                 f":!{REL}/factory/backlog.md" if str(REL) != "." else ":!factory/backlog.md",
+                 f":!{REL}/factory/jobs" if str(REL) != "." else ":!factory/jobs"], cwd=REPO).stdout.strip()
+    current = run(["git", "branch", "--show-current"], cwd=REPO).stdout.strip()
+    if dirty or current != job["base"]:
+        set_stage(job, "needs-human")
+        why = "it has uncommitted changes" if dirty else f"it is on {current!r}, not {job['base']!r}"
+        say(f"{job['id']}: approved, but the main checkout is busy ({why}). "
+            f"Run `factory approve {job['id']}` once it is clean and on {job['base']}.")
+        return False
+    if gate(job, merge=True) != "PASS":
+        escalate(job, f"The checks failed right before merging. See round-{job['round']}/merge-checks.md.")
+        needs_human(job)
+        return False
+    res = run(["git", "merge", "--no-ff", job["branch"], "-m", f"Merge {job['branch']}"], cwd=REPO, check=False)
+    if res.returncode != 0:
+        run(["git", "merge", "--abort"], cwd=REPO, check=False)
+        escalate(job, f"`git merge --no-ff {job['branch']}` failed:\n\n```\n{(res.stdout + res.stderr).strip()}\n```")
+        needs_human(job)
+        return False
+    removed = run(["git", "worktree", "remove", job["worktree"]], cwd=REPO, check=False)
+    if removed.returncode == 0:
+        run(["git", "branch", "-d", job["branch"]], cwd=REPO, check=False)
+    else:
+        say(f"{job['id']}: merged, but `git worktree remove` said: {removed.stderr.strip()}")
+    set_stage(job, "merged")
+    say(f"{job['id']}: merged into {job['base']}")
+    return True
+
+
+def loop(job, build_message, resumes_left=MAX_RESUMES):
+    """From a build message to merged or needs-human."""
+    while True:
+        if not build(job, build_message):
+            return needs_human(job)
+        start_round(job)
+        verdict = gate(job)
+        set_stage(job, "review", gate=verdict)
+        say(f"{job['id']}: round {job['round']}, gate {verdict}")
+        if verdict == "FAIL":
+            if resumes_left == 0:
+                escalate(job, f"The gate failed in round {job['round']}, the last allowed round. "
+                              f"See round-{job['round']}/checks.md.")
+                return needs_human(job)
+            resumes_left -= 1
+            build_message = (f"The gate failed in round {job['round']}; see {job_path(job['id'])}/round-{job['round']}/checks.md. "
+                             f"Fix it, commit, and update build.md for round {job['round'] + 1}.")
+            say(f"{job['id']}: resuming builder ({resumes_left} resumes left)")
+            continue
+        changes = review_round(job)
+        if not changes:
+            break
+        if resumes_left == 0:
+            escalate(job, f"Review rounds exhausted. Outstanding CHANGES in round-{job['round']}/ from: {', '.join(changes)}.")
+            return needs_human(job)
+        resumes_left -= 1
+        build_message = (f"Round {job['round']} reviews are in {job_path(job['id'])}/round-{job['round']}/. "
+                         f"Address every review with VERDICT: CHANGES, commit, and update build.md for round {job['round'] + 1}.")
+        say(f"{job['id']}: {', '.join(changes)} want changes → resuming builder ({resumes_left} resumes left)")
+    set_stage(job, "approve")
+    run_agent(job, "approver", f"{paths_sentence(job)} Final round: {job['round']}.")
+    decision = first_line(job_path(job["id"]) / "decision.md")
+    say(f"{job['id']}: approver says {decision}")
+    if decision == "APPROVE":
+        merge(job)
+    elif decision == "ESCALATE":
+        needs_human(job)
+    else:
+        raise Stop(f"decision.md starts with {decision!r}, not APPROVE or ESCALATE")
+
+
+# ---- Commands --------------------------------------------------------------
+
+
+def cmd_run(feature, slug=None):
+    job = create_job(feature, slug)
+    say(f"{job['id']}: created on {job['branch']} (worktree {job['worktree']})")
+    try:
+        setup_worktree(job)
+        write_spec(job)
+        loop(job, f"{paths_sentence(job)} Build round 1. Port: {port_for(job, 'builder')}.")
+    except Stop as e:
+        set_stage(job, "needs-human")
+        escalate(job, f"The factory stopped: {e}")
+        die(f"{job['id']}: {e}\nThe job is in needs-human; its worktree is {job['worktree']}.")
+    return job
+
+
+def cmd_next():
+    backlog = FACTORY / "backlog.md"
+    lines = backlog.read_text().splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("- [ ] "):
+            item = line[6:].strip()
+            lines[i] = f"- [x] {item} → claimed"
+            backlog.write_text("\n".join(lines) + "\n")
+            job = cmd_run(item)
+            text = backlog.read_text().replace(f"- [x] {item} → claimed", f"- [x] {item} → {job['id']}")
+            backlog.write_text(text)
+            return
+    say("the backlog has no unchecked items")
+
+
+def cmd_approve(job_id):
+    job = load(job_id)
+    if job["stage"] != "needs-human":
+        die(f"{job_id} is in {job['stage']}, not needs-human")
+    try:
+        merge(job)
+    except Stop as e:
+        die(str(e))
+
+
+def cmd_rework(job_id, note):
+    job = load(job_id)
+    if job["stage"] != "needs-human":
+        die(f"{job_id} is in {job['stage']}, not needs-human")
+    d = job_path(job_id)
+    k = len(list(d.glob("rework-*.md"))) + 1
+    (d / f"rework-{k}.md").write_text(note.strip() + "\n")
+    job["sessions"].pop("builder", None)  # a rework gets a fresh builder
+    job["ended"] = None
+    save(job)
+    try:
+        loop(job, f"{paths_sentence(job)} Rework: read rework-{k}.md and address it, then update build.md "
+                  f"for round {job['round'] + 1}. Port: {port_for(job, 'builder')}.")
+    except Stop as e:
+        set_stage(job, "needs-human")
+        die(f"{job_id}: {e}")
+
+
+def cmd_status():
+    jobs = all_jobs()
+    if not jobs:
+        say("no jobs yet")
+        return
+    for j in jobs:
+        reviews = " ".join(f"{k}:{v}" for k, v in j["reviews"].items()) if j["round"] else ""
+        say(f"{j['id']:<32} {j['stage']:<12} round {j['round']}  gate {j['gate'] or '-':<5} {reviews}")
+
+
+def cmd_plan(feature):
+    numbers = [job_number(p.name) for p in JOBS.iterdir() if p.name[:3].isdigit()] if JOBS.exists() else []
+    job_id = f"{max(numbers, default=0) + 1:03d}-{slugify(feature)}"
+    job = {"id": job_id, "feature": feature, "branch": f"factory/{job_id}", "worktree": str(worktree_path(job_id)), "base": BASE}
+    say(f"job        {job_id}\nbranch     {job['branch']}\nworktree   {job['worktree']}\n"
+        f"project    {project_in(job['worktree'])}\nbase       {BASE}\n")
+    steps = [("spec-writer", f"{paths_sentence(job)} Feature: {feature}"),
+             ("builder", f"{paths_sentence(job)} Build round 1. Port: {port_for(job, 'builder')}.")]
+    for r in REVIEWERS:
+        prompt = f"{paths_sentence(job)} Review round 1."
+        if r in {"ux", "ui"}:
+            prompt += f" Port: {port_for(job, r)}."
+        steps.append((f"reviewer-{r}", prompt))
+    steps.append(("approver", f"{paths_sentence(job)} Final round: 1."))
+    for agent, prompt in steps:
+        say(f"# {agent}\n" + shlex.join(claude_command(job, agent, prompt)) + "\n")
+    say("Between builder and reviewers: bash factory/checks.sh in the worktree (the gate).\n"
+        "Reviewers run in parallel; the loop resumes the builder on gate FAIL or any CHANGES.")
+
+
+def cmd_dashboard(port):
+    say(f"Dashboard: http://localhost:{port}/dashboard.html  (Ctrl-C to stop)")
+    os.execvp(sys.executable, [sys.executable, "-m", "http.server", str(port), "--directory", str(FACTORY)])
+
+
+# ---- Demo ------------------------------------------------------------------
+
+SEED_EXCLUDE = {"apps", "node_modules", ".git", ".env", "__pycache__", ".sandbox"}
+
+
+def seed_sandbox(sandbox):
+    """A fresh repo with the factory but none of its apps, as if job 001 had never run."""
+    worktrees = sandbox.parent / f"{sandbox.name}-factory"
+    for path in (sandbox, worktrees):
+        if path.exists():
+            shutil.rmtree(path)
+    sandbox.mkdir(parents=True)
+
+    def ignore(dir_, names):
+        skip = set(n for n in names if n in SEED_EXCLUDE)
+        if Path(dir_) == FACTORY:
+            skip.add("jobs")
+        return skip
+
+    shutil.copytree(PROJECT, sandbox, ignore=ignore, dirs_exist_ok=True)
+    (sandbox / "factory" / "jobs").mkdir()
+    agents_md = sandbox / "AGENTS.md"
+    text = agents_md.read_text()
+    text = re.sub(r"(## Apps\n\n)(?:.|\n)*\Z", r"\1- (none yet)\n", text)
+    agents_md.write_text(text)
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+    git = lambda *a: run(["git", *a], cwd=sandbox, env=env)
+    git("init", "-q", "-b", "main")
+    git("config", "user.name", "Software Factory Demo")
+    git("config", "user.email", "factory@example.invalid")
+    git("config", "commit.gpgsign", "false")
+    git("add", "-A")
+    git("commit", "-q", "-m", "Seed the insurtech apps repo")
+    return env
+
+
+def cmd_demo(sandbox, keep):
+    sample = job_path(SAMPLE_JOB) / "job.json"
+    if not sample.exists():
+        die(f"the sample job {SAMPLE_JOB} is missing from factory/jobs/")
+    if not shutil.which("node"):
+        die("node is not installed; the sample app's tests need Node 20+")
+    feature = json.loads(sample.read_text())["feature"]
+    say(f"Seeding a throwaway repo at {sandbox} (no apps, empty job list)…")
+    try:
+        env = seed_sandbox(sandbox)
+    except Stop as e:
+        die(str(e))
+    env.update({
+        "FACTORY_CLAUDE_BIN": str(sandbox / "factory" / "mock" / "claude"),
+        "FACTORY_REPLAY_FROM": str(PROJECT),
+        "FACTORY_BASE_BRANCH": "main",
+        "FACTORY_SANDBOX": str(sandbox),
+    })
+    env.pop("FACTORY_CLAUDE_FLAGS", None)
+    runner = [sys.executable, str(sandbox / "factory" / "bin" / "factory")]
+    say(f"\n$ factory run \"{feature}\"\n")
+    res = subprocess.run(runner + ["run", feature, "--slug", SAMPLE_JOB.split("-", 1)[1]], cwd=sandbox, env=env)
+    if res.returncode != 0:
+        die("the demo run failed; see the output above", res.returncode)
+    job = json.loads((sandbox / "factory" / "jobs" / SAMPLE_JOB / "job.json").read_text())
+    if job["stage"] == "needs-human":
+        say(f"\nThe approver escalated, as it should for a pricing rule. Acting as the human:\n")
+        say(f"$ factory approve {SAMPLE_JOB}\n")
+        res = subprocess.run(runner + ["approve", SAMPLE_JOB], cwd=sandbox, env=env)
+        if res.returncode != 0:
+            die("the approval failed; see the output above", res.returncode)
+    log = run(["git", "log", "--oneline", "--graph"], cwd=sandbox).stdout.strip()
+    say(f"\nSandbox history:\n{indent(log)}\n")
+    say("Running the merged app's tests one more time, from main:")
+    checks = subprocess.run(["bash", "factory/checks.sh"], cwd=sandbox, text=True, capture_output=True)
+    tail = "\n".join((checks.stdout + checks.stderr).strip().splitlines()[-8:])
+    say(indent(tail))
+    if checks.returncode != 0:
+        die("the merged app's tests failed", checks.returncode)
+    say(f"\nDone. The job's files are in {sandbox}/factory/jobs/{SAMPLE_JOB}/ and the app in {sandbox}/apps/.")
+    say(f"Dashboard:  python3 {sandbox}/factory/bin/factory dashboard    then open http://localhost:8000/dashboard.html")
+    say(f"Try the app: cd {sandbox}/apps/marine-cargo-quote && npm start    then open http://localhost:5101")
+    if not keep:
+        say(f"Remove it with: rm -rf {sandbox} {sandbox.parent / (sandbox.name + '-factory')}")
+
+
+# ---- Main ------------------------------------------------------------------
+
+
+def main(argv):
+    if not argv or argv[0] in {"-h", "--help"}:
+        print(__doc__.strip())
+        return
+    cmd, args = argv[0], argv[1:]
+
+    def option(name, default=None):
+        if name in args:
+            i = args.index(name)
+            value = args[i + 1] if i + 1 < len(args) else die(f"{name} needs a value")
+            del args[i:i + 2]
+            return value
+        return default
+
+    def flag(name):
+        if name in args:
+            args.remove(name)
+            return True
+        return False
+
+    if cmd == "run":
+        slug = option("--slug")
+        if len(args) != 1:
+            die('usage: factory run "<feature>" [--slug <slug>]')
+        cmd_run(args[0], slug)
+    elif cmd == "next" and not args:
+        cmd_next()
+    elif cmd == "approve" and len(args) == 1:
+        cmd_approve(args[0])
+    elif cmd == "rework" and len(args) == 2:
+        cmd_rework(args[0], args[1])
+    elif cmd == "status" and not args:
+        cmd_status()
+    elif cmd == "plan" and len(args) == 1:
+        cmd_plan(args[0])
+    elif cmd == "demo":
+        sandbox = Path(option("--sandbox", str(SANDBOX))).expanduser().resolve()
+        keep = flag("--keep")
+        if args:
+            die("usage: factory demo [--sandbox <dir>] [--keep]")
+        cmd_demo(sandbox, keep)
+    elif cmd == "dashboard":
+        port = int(option("--port", "8000"))
+        if args:
+            die("usage: factory dashboard [--port <port>]")
+        cmd_dashboard(port)
+    else:
+        die(f"bad arguments: {' '.join(argv)}\n\n{__doc__.strip()}")
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())  # e.g. piped into head
+        sys.exit(0)
