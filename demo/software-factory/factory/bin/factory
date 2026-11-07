@@ -666,4 +666,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         sys.exit(130)
     except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())  # e.g. piped into head
         sys.exit(0)
