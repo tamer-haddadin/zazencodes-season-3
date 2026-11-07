@@ -1,0 +1,21 @@
+{
+  "id": "001-marine-cargo-quote",
+  "feature": "Marine cargo premium quote micro-app: a form for cargo value, transport mode, cargo type, route, ICC cover and deductible that returns an indicative AED premium with a VAT-inclusive breakdown",
+  "branch": "factory/001-marine-cargo-quote",
+  "worktree": "/tmp/software-factory-demo-factory/001-marine-cargo-quote",
+  "base": "main",
+  "stage": "merged",
+  "round": 1,
+  "gate": "PASS",
+  "reviews": {
+    "security": "PASS",
+    "ux": "PASS",
+    "ui": "PASS",
+    "code": "PASS"
+  },
+  "started": "2026-11-07T16:33:30Z",
+  "ended": "2026-11-07T16:33:32Z",
+  "sessions": {
+    "builder": "mock-f62a97b6-6d75-4486-a498-dc5c43baf26b"
+  }
+}

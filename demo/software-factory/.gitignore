@@ -1,0 +1,10 @@
+# Local secrets. Copy .env.example to .env and keep it out of git.
+.env
+
+# Runtime state the factory writes while a job runs. The sample job in
+# factory/jobs/001-marine-cargo-quote/ is force-added so the demo can be read
+# without running it; new jobs stay local.
+factory/jobs/*
+!factory/jobs/001-marine-cargo-quote/
+
+node_modules/

@@ -55,3 +55,6 @@ ehthumbs.db
 !src/software-engineers-using-coding-agents/vegan-bars/.claude
 !src/software-factory-claude-code/.claude
 !src/software-factory-claude-code-v2/.claude
+
+# Demo factory whose agent config is part of the published source
+!demo/software-factory/.claude

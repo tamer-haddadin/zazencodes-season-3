@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""A scripted stand-in for the `claude` binary, for `factory demo`.
+
+The runner spawns it exactly as it would spawn Claude Code:
+
+    claude -p "<prompt>" --agent <name> --output-format json ...
+
+Instead of calling a model, it replays the committed sample job: each agent
+copies the file it would have written from $FACTORY_REPLAY_FROM (the project
+holding factory/jobs/<job-id>/ and apps/), and the builder also copies the
+app's code into the worktree, runs its tests and commits. Everything around
+it (worktree, gate, verdict parsing, merge) is the real runner. It prints the
+same JSON result envelope Claude Code prints, so the runner cannot tell the
+difference.
+
+It knows nothing but the sample job. Any other feature gets an error result,
+the way a real agent failure would.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+
+def result(text, error=False):
+    print(json.dumps({
+        "type": "result", "subtype": "success" if not error else "error_during_execution",
+        "is_error": error, "result": text, "session_id": f"mock-{uuid.uuid4()}",
+        "total_cost_usd": 0.0, "num_turns": 1, "duration_ms": 0,
+    }))
+    sys.exit(1 if error else 0)
+
+
+def arg(flag, argv):
+    return argv[argv.index(flag) + 1] if flag in argv and argv.index(flag) + 1 < len(argv) else None
+
+
+def copy_tree(src, dst):
+    shutil.copytree(src, dst, dirs_exist_ok=True, ignore=shutil.ignore_patterns("node_modules", "__pycache__"))
+
+
+def main(argv):
+    prompt = arg("-p", argv) or arg("--print", argv)
+    agent = arg("--agent", argv) or os.environ.get("FACTORY_AGENT")
+    if not prompt or not agent:
+        result("mock claude: expected -p <prompt> and --agent <name>", error=True)
+
+    m = re.search(r"Job folder: (.+?)/?\. Worktree: (.+?)\. Project: (.+?)\. Branch: (.+?)\.", prompt)
+    if not m:
+        result("mock claude: the prompt does not start with the factory's paths sentence", error=True)
+    job_dir, worktree, project, branch = Path(m.group(1)), Path(m.group(2)), Path(m.group(3)), m.group(4)
+    job_id = job_dir.name
+
+    replay_root = Path(os.environ.get("FACTORY_REPLAY_FROM", ""))
+    replay = replay_root / "factory" / "jobs" / job_id
+    if not replay.is_dir():
+        result(f"mock claude: no recorded run for {job_id} under {replay_root}/factory/jobs/. "
+               "The mock engine only knows the sample job; use real Claude Code for new features.", error=True)
+
+    time.sleep(float(os.environ.get("FACTORY_MOCK_DELAY", "1.5")))
+
+    round_match = re.search(r"(?:Review round|Build round|Final round:|in round) (\d+)", prompt)
+    rnd = int(round_match.group(1)) if round_match else 1
+
+    if agent == "spec-writer":
+        shutil.copy(replay / "spec.md", job_dir / "spec.md")
+        result(f"Wrote {job_dir / 'spec.md'}")
+
+    if agent == "builder":
+        if "Build round 1" in prompt:
+            current = subprocess.run(["git", "branch", "--show-current"], cwd=worktree, text=True, capture_output=True).stdout.strip()
+            if current != branch:
+                (job_dir / "build.md").write_text(f"STATUS: BLOCKED\n\n## Blocked\nExpected branch {branch}, found {current}.\n")
+                result("BLOCKED: wrong branch")
+            staged = []
+            for app in sorted((replay_root / "apps").iterdir()):
+                if app.is_dir() and not (project / "apps" / app.name).exists():
+                    copy_tree(app, project / "apps" / app.name)
+                    staged.append(str((project / "apps" / app.name).relative_to(worktree)))
+            shutil.copy(replay_root / "AGENTS.md", project / "AGENTS.md")
+            staged.append(str((project / "AGENTS.md").relative_to(worktree)))
+            for path in staged:
+                if path.startswith("apps/") or "/apps/" in path:
+                    tests = subprocess.run(["npm", "test", "--silent"], cwd=worktree / path, text=True, capture_output=True)
+                    if tests.returncode != 0:
+                        (job_dir / "build.md").write_text(
+                            "STATUS: BLOCKED\n\n## Blocked\n`npm test` fails in the replayed app:\n\n```\n"
+                            + (tests.stdout + tests.stderr)[-3000:] + "\n```\n")
+                        result("BLOCKED: tests fail")
+            title = next((l[2:].strip() for l in (replay / "spec.md").read_text().splitlines() if l.startswith("# ")), job_id)
+            subprocess.run(["git", "add", "--", *staged], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", f"Add {title[0].lower() + title[1:]}"], cwd=worktree, check=True)
+        shutil.copy(replay / "build.md", job_dir / "build.md")
+        result(f"Wrote {job_dir / 'build.md'}")
+
+    if agent.startswith("reviewer-"):
+        lens = agent.removeprefix("reviewer-")
+        src = replay / f"round-{rnd}" / f"review-{lens}.md"
+        dst = job_dir / f"round-{rnd}" / f"review-{lens}.md"
+        dst.parent.mkdir(exist_ok=True)
+        if src.exists():
+            shutil.copy(src, dst)
+        else:
+            dst.write_text(f"VERDICT: PASS\n\n## Findings\nNone.\n\n## Notes\n- No recorded round {rnd} review; the mock engine passes it.\n")
+        result(f"Wrote {dst}")
+
+    if agent == "approver":
+        shutil.copy(replay / "decision.md", job_dir / "decision.md")
+        result(f"Wrote {job_dir / 'decision.md'}")
+
+    result(f"mock claude: unknown agent {agent}", error=True)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
